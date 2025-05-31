@@ -18,6 +18,7 @@ require "uri"
 
 require_relative "../mcp/sse_client"
 require_relative "../mcp/stdio_client"
+require_relative "../mcp/tool_name_mapper"
 
 module Raix
   # Model Context Protocol integration for Raix
@@ -35,6 +36,8 @@ module Raix
     JSONRPC_VERSION = "2.0".freeze
 
     class_methods do
+      attr_reader :tool_name_mapper
+
       # Declare an MCP server by URL, using the SSE transport.
       #
       #   sse_mcp "https://server.example.com/sse",
@@ -72,6 +75,7 @@ module Raix
       # NOTE TO SELF: NEVER MOCK SERVER RESPONSES! THIS MUST WORK WITH REAL SERVERS!
       def mcp(client:, only: nil, except: nil)
         @mcp_servers ||= {}
+        @tool_name_mapper ||= MCP::ToolNameMapper.new
 
         return if @mcp_servers.key?(client.unique_key) # avoid duplicate definitions
 
@@ -102,7 +106,8 @@ module Raix
         filtered_tools.each do |tool|
           remote_name = tool.name
           # TODO: Revisit later whether this much context is needed in the function name
-          local_name = "#{client.unique_key}_#{remote_name}".to_sym
+          original_long_name = "#{client.unique_key}_#{remote_name}".to_sym
+          local_name = @tool_name_mapper.register_tool(original_long_name, remote_name)
 
           description = tool.description
           input_schema = tool.input_schema || {}
@@ -127,32 +132,34 @@ module Raix
             stored_schema = self.class.instance_variable_get(:@tool_schemas)&.dig(local_name)
             coerced_arguments = coerce_arguments(arguments, stored_schema)
 
-            content_text = client.call_tool(remote_name, **coerced_arguments)
+            mapper = self.class.tool_name_mapper
+            actual_remote_name = mapper.remote_name_from_local(local_name) || remote_name
+
+            content_text = client.call_tool(actual_remote_name, **coerced_arguments)
             call_id = SecureRandom.uuid
 
             # Mirror FunctionDispatch transcript behaviour
-            transcript << [
-              {
-                role: "assistant",
-                content: nil,
-                tool_calls: [
-                  {
-                    id: call_id,
-                    type: "function",
-                    function: {
-                      name: remote_name,
-                      arguments: arguments.to_json
-                    }
+            transcript << {
+              role: "assistant",
+              content: nil,
+              tool_calls: [
+                {
+                  id: call_id,
+                  type: "function",
+                  function: {
+                    name: actual_remote_name,
+                    arguments: arguments.to_json
                   }
-                ]
-              },
-              {
-                role: "tool",
-                tool_call_id: call_id,
-                name: remote_name,
-                content: content_text
-              }
-            ]
+                }
+              ]
+            }
+
+            transcript << {
+              role: "tool",
+              tool_call_id: call_id,
+              name: actual_remote_name,
+              content: content_text
+            }
 
             # Continue the chat loop if requested (same semantics as FunctionDispatch)
             chat_completion(**chat_completion_args) if loop

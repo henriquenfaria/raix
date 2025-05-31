@@ -147,6 +147,13 @@ module Raix
             # dispatch the called function
             arguments = JSON.parse(tool_call["function"]["arguments"].presence || "{}")
             function_name = tool_call["function"]["name"]
+
+            # Map the function name if we have an MCP tool name mapper
+            if self.class.respond_to?(:tool_name_mapper) && self.class.tool_name_mapper
+              mapped_name = self.class.tool_name_mapper.local_name_from_remote(function_name)
+              function_name = mapped_name if mapped_name
+            end
+
             raise "Unauthorized function call: #{function_name}" unless self.class.functions.map { |f| f[:name].to_sym }.include?(function_name.to_sym)
 
             dispatch_tool_function(function_name, arguments.with_indifferent_access)

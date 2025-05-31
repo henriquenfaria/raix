@@ -326,3 +326,157 @@ RSpec.describe "MCP type coercion" do
     expect(result["bool4"]).to eq(false)
   end
 end
+
+RSpec.describe "MCP tool name mapping" do
+  let(:test_class) do
+    Class.new do
+      include Raix::ChatCompletion
+      include Raix::MCP
+
+      def self.name
+        "TestMcpNameMapping"
+      end
+    end
+  end
+
+  let(:mock_client) do
+    double("MCP::SseClient").tap do |client|
+      allow(client).to receive(:unique_key).and_return("very_long_server_url_that_will_make_tool_names_exceed_limit")
+      allow(client).to receive(:close)
+    end
+  end
+
+  let(:mock_tools) do
+    [
+      Raix::MCP::Tool.new(
+        name: "tool_with_long_name_for_testing",
+        description: "Test tool",
+        input_schema: { "type" => "object", "properties" => {} }
+      )
+    ]
+  end
+
+  before do
+    allow(mock_client).to receive(:tools).and_return(mock_tools)
+  end
+
+  it "generates local tool names to avoid API limits" do
+    test_class.mcp(client: mock_client)
+
+    # Check that the function was registered with a local name
+    function_names = test_class.functions.map { |f| f[:name] }
+    expect(function_names).to include(:mcp_tool_1)
+    expect(function_names).not_to include(:very_long_server_url_that_will_make_tool_names_exceed_limit_tool_with_long_name_for_testing)
+  end
+
+  it "uses the original tool name when calling the remote server" do
+    test_class.mcp(client: mock_client)
+
+    instance = test_class.new
+    instance.instance_variable_set(:@transcript, [])
+    instance.instance_variable_set(:@loop, false)
+
+    # Expect the client to be called with the original tool name
+    allow(mock_client).to receive(:call_tool) do |name, **kwargs|
+      expect(name).to eq("tool_with_long_name_for_testing")
+      expect(kwargs).to eq({})
+      "response"
+    end
+
+    # Call the local method name
+    instance.mcp_tool_1({}, nil)
+  end
+
+  it "records the original tool name in the transcript" do
+    test_class.mcp(client: mock_client)
+
+    instance = test_class.new
+    instance.instance_variable_set(:@transcript, [])
+    instance.instance_variable_set(:@loop, false)
+
+    allow(mock_client).to receive(:call_tool).and_return("response")
+
+    instance.mcp_tool_1({}, nil)
+
+    # Check that the transcript uses the original tool name
+    transcript = instance.instance_variable_get(:@transcript)
+    tool_call = transcript.first[:tool_calls].first
+    tool_response = transcript.last
+
+    expect(tool_call[:function][:name]).to eq("tool_with_long_name_for_testing")
+    expect(tool_response[:name]).to eq("tool_with_long_name_for_testing")
+  end
+
+  it "maps all tool names consistently regardless of length" do
+    short_client = double("MCP::SseClient")
+    allow(short_client).to receive(:unique_key).and_return("short")
+    allow(short_client).to receive(:close)
+
+    short_tool = Raix::MCP::Tool.new(
+      name: "simple_tool",
+      description: "Test tool",
+      input_schema: { "type" => "object", "properties" => {} }
+    )
+
+    allow(short_client).to receive(:tools).and_return([short_tool])
+
+    test_class.mcp(client: short_client)
+
+    # Even short names are now mapped
+    function_names = test_class.functions.map { |f| f[:name] }
+    expect(function_names).to include(:mcp_tool_1)
+    expect(function_names).not_to include(:short_simple_tool)
+  end
+
+  it "handles function calls using the remote tool name" do
+    test_class.mcp(client: mock_client)
+
+    instance = test_class.new
+    instance.instance_variable_set(:@transcript, [])
+    instance.instance_variable_set(:@loop, false)
+
+    # Mock the chat completion response with the remote tool name
+    response = {
+      "choices" => [{
+        "message" => {
+          "tool_calls" => [{
+            "function" => {
+              "name" => "tool_with_long_name_for_testing", # Using remote name
+              "arguments" => "{}"
+            }
+          }]
+        }
+      }]
+    }
+
+    allow(mock_client).to receive(:call_tool).and_return("response")
+
+    # The instance should be able to handle the function call even though it uses the remote name
+    Thread.current[:chat_completion_response] = response
+    result = instance.instance_eval do
+      tool_calls = response.dig("choices", 0, "message", "tool_calls")
+      tool_calls.map do |tool_call|
+        arguments = JSON.parse(tool_call["function"]["arguments"])
+        function_name = tool_call["function"]["name"]
+
+        # Map the function name if we have an MCP tool name mapper
+        if self.class.respond_to?(:tool_name_mapper) && self.class.tool_name_mapper
+          mapped_name = self.class.tool_name_mapper.local_name_from_remote(function_name)
+          function_name = mapped_name if mapped_name
+        end
+
+        # Should not raise an error
+        raise "Unauthorized function call: #{function_name}" unless self.class.functions.map { |f| f[:name].to_sym }.include?(function_name.to_sym)
+
+        dispatch_tool_function(function_name, arguments.with_indifferent_access)
+      end
+    end
+
+    expect(result).to eq(["response"])
+
+    # Verify the transcript shows the original tool name
+    transcript = instance.instance_variable_get(:@transcript)
+    expect(transcript.first[:tool_calls].first[:function][:name]).to eq("tool_with_long_name_for_testing")
+    expect(transcript.last[:name]).to eq("tool_with_long_name_for_testing")
+  end
+end
